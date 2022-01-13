@@ -1,55 +1,67 @@
 import asyncio
-import json
 from typing import Optional, Union
 
-import aiohttp
-
 from . import models
+from .api import ApiService, ApiMethods
+from .cache.base import BaseCache
+from .consts import DAY, HOUR, MINUTE
 
 LENTA_BASE_URL = "https://lenta.com/api"
+FAKE_USER_AGENT = "Mozilla/5.0 (iPhone; CPU iPhone OS 12_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) " \
+                  "CriOS/69.0.3497.105 Mobile/15E148 Safari/605.1"
 
 
 class LentaClient:
 
-    def __init__(self,
-                 loop: Optional[Union[asyncio.BaseEventLoop, asyncio.AbstractEventLoop]] = None,
-                 base_url: str = LENTA_BASE_URL,
-                 ):
+    def __init__(
+            self,
+            loop: Optional[Union[asyncio.BaseEventLoop, asyncio.AbstractEventLoop]] = None,
+            base_url: str = LENTA_BASE_URL,
+            cache_storage: Optional[BaseCache] = None,
+            api_service: Optional[ApiService] = None,
+    ):
         self._main_loop = loop
-        self._session = self.get_new_session()
         self._base_url = base_url
+        if api_service is None:
+            api_service = ApiService(cache=cache_storage)
 
-    def get_new_session(self) -> aiohttp.ClientSession:
-        return aiohttp.ClientSession(
-            loop=self._main_loop,
-            json_serialize=json.dumps,
-        )
+        self._api_service = api_service
 
-    async def make_request(self, endpoint: str,
-                           method: str = "GET",
-                           params: Optional[dict] = None,
-                           data: Optional[dict] = None) -> Union[list[dict], dict]:
+    async def request(
+            self,
+            api_method: str,
+            http_method: str,
+            params: Optional[dict] = None,
+            json: Optional[dict] = None,
+            cache_time: int = 0.
+    ) -> Union[dict, list]:
         """
-        Формирование запроса
-        :param endpoint: Url метода
-        :param method: Метод запроса
-        :param params: Url параметры
-        :param data: Тело запроса
+        Выполнение запроса
+        :param api_method:
+        :param http_method:
+        :param params:
+        :param json:
+        :param cache_time:
         :return:
         """
-        url = self.build_url(endpoint)
-        async with self._session.request(method, url, json=data, params=params) as response:
-            return await response.json()
-
-    def build_url(self, endpoint: str) -> str:
-        return f"{self._base_url}{endpoint}"
+        return await self._api_service.api_request(
+            http_method,
+            api_method,
+            params,
+            json,
+            cache_time,
+        )
 
     async def get_cities(self) -> list[models.City]:
         """
         Получение списка городов, в которых есть магазины Ленты
         :return: Список городов
         """
-        result = await self.make_request("/v1/cities")
+        result = await self.request(
+            ApiMethods.GET_CITIES,
+            "GET",
+            cache_time=DAY
+        )
         return [models.City(**city) for city in result]
 
     async def get_stores(self) -> list[models.Store]:
@@ -57,7 +69,11 @@ class LentaClient:
         Получение списка магазинов Ленты
         :return:  Список магазинов
         """
-        result = await self.make_request("/v1/stores")
+        result = await self.request(
+            ApiMethods.GET_STORES,
+            "GET",
+            cache_time=DAY
+        )
         return [models.Store(**store) for store in result]
 
     async def get_city_stores(self, city_id: str) -> list[models.Store]:
@@ -66,13 +82,17 @@ class LentaClient:
         :param city_id: Идентификатор города
         :return: Список магазинов для города
         """
-        result = await self.make_request(f"/v1/cities/{city_id}/stores")
+        result = await self.request(
+            ApiMethods.GET_CITY_STORES.format(city_id=city_id),
+            "GET",
+            cache_time=DAY
+        )
         return [models.Store(**store) for store in result]
 
     async def search_skus_in_store(
             self, store_id: str, search_value: Optional[str] = None, limit: int = 10, offset: int = 0,
             max_price: Optional[float] = None, min_price: Optional[float] = None, sorting: Optional[str] = None,
-            only_discounts: bool = False
+            only_discounts: bool = False, node_code: Optional[str] = None,
     ) -> list[models.BaseSku]:
         """
         Поиск товара в магазине
@@ -84,6 +104,7 @@ class LentaClient:
         :param sorting: Поле сортировки
         :param only_discounts: Только товары со скидками
         :param search_value: Название товара для поиска
+        :param node_code: Код категории
         :return: Найденные товары
         """
         payload = {
@@ -94,8 +115,13 @@ class LentaClient:
             "minPrice": min_price,
             "sorting": sorting,
             "onlyDiscounts": only_discounts,
+            "nodeCode": node_code,
         }
-        result = await self.make_request(f"/v1/stores/{store_id}/skus", "POST", data=payload)
+        result = await self.request(
+            ApiMethods.STORE_SKUS.format(store_id=store_id),
+            "POST",
+            json=payload,
+        )
         return [models.BaseSku(**sku) for sku in result["skus"]]
 
     async def get_store(self, store_id: str) -> models.Store:
@@ -105,7 +131,11 @@ class LentaClient:
         :return: Магазин
         """
 
-        result = await self.make_request(f"/v1/stores/{store_id}")
+        result = await self.request(
+            ApiMethods.GET_STORE.format(store_id=store_id),
+            "GET",
+            cache_time=DAY
+        )
         return models.Store(**result)
 
     async def get_sku_in_store_by_barcode(self, store_id: str, barcode: str) -> models.BaseSku:
@@ -115,10 +145,14 @@ class LentaClient:
         :param barcode:
         :return: Товар
         """
-
-        result = await self.make_request(f"/v1/stores/{store_id}/skus", params={
-            "barcode": barcode,
-        })
+        result = await self.request(
+            ApiMethods.STORE_SKUS.format(store_id=store_id),
+            "GET",
+            params={
+                "barcode": barcode,
+            },
+            cache_time=HOUR
+        )
         return models.BaseSku(**result)
 
     async def get_store_skus_by_ids(self, store_id: str, sku_ids: list[str]) -> list[models.BaseSku]:
@@ -131,7 +165,12 @@ class LentaClient:
         payload = {
             "skuCodes": sku_ids
         }
-        result = await self.make_request(f"/v1/stores/{store_id}/skuslist", "POST", data=payload)
+        result = await self.request(
+            f"/v1/stores/{store_id}/skuslist",
+            "POST",
+            json=payload,
+            cache_time=MINUTE * 5
+        )
         return [models.BaseSku(**sku) for sku in result]
 
     async def get_sku(self, store_id: str, code: str) -> models.BaseSku:
@@ -142,5 +181,23 @@ class LentaClient:
         :return: Товар
         """
 
-        result = await self.make_request(f"/v1/stores/{store_id}/skus/{code}")
+        result = await self.request(
+            ApiMethods.GET_STORE_SKUS.format(store_id=store_id, code=code),
+            "GET",
+            cache_time=MINUTE * 5,
+        )
         return models.BaseSku(**result)
+
+    async def get_catalog(self, store_id: str) -> models.Catalog:
+        """
+        Получение каталога для магазина
+        :param store_id: Идентификатор магазина
+        :return: Каталог магазина
+        """
+
+        result = await self.request(
+            ApiMethods.GET_CATALOG.format(store_id=store_id),
+            "GET",
+            cache_time=HOUR,
+        )
+        return models.Catalog(**result)
